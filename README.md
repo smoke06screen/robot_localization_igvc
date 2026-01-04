@@ -28,3 +28,18 @@ odom → locally smooth frame
 base_link → robot body frame
 imu_link, gps_link → sensor frames
 utm → intermediate Cartesian GPS frame
+
+
+NOTE:
+Before running the GPS launch
+You must install the GPS driver being used (NMEA driver).
+sudo apt update
+sudo apt install ros-humble-nmea-navsat-driver
+
+Serial / communication ports
+Both GPS and IMU ports must be set correctly before launching.
+
+Check available ports using:
+ls /dev/tty*
+
+Update the launch file / driver configs with the correct port names.

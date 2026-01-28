@@ -1,284 +1,165 @@
 #!/usr/bin/env python3
-import time
+
 import math
-import serial
 import struct
-import numpy as np
 import threading
+import serial
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
 
-# Globals used by the parser / publisher
-key = 0
-buff = {}
-angularVelocity = [0.0, 0.0, 0.0]   # rad/s (after scaling in parser)
-acceleration = [0.0, 0.0, 0.0]      # m/s^2  (after scaling in parser)
-magnetometer = [0, 0, 0]
-angle_degree = [0.0, 0.0, 0.0]      # degrees (from parser)
 
+class WTIMUNode(Node):
+    def __init__(self):
+        super().__init__('wt_imu_node')
 
-def hex_to_short(raw_bytes):
-    """
-    raw_bytes: iterable of 8 integers (bytes)
-    returns list of 4 signed shorts
-    """
-    # Ensure bytes object
-    b = bytes(raw_bytes)
-    try:
-        # little-endian signed shorts (4 values)
-        return list(struct.unpack('<hhhh', b))
-    except struct.error:
-        # In case of malformed input, return zeros
-        return [0, 0, 0, 0]
+        # ---------------- Parameters ----------------
+        self.declare_parameter('port', '/dev/imu')
+        self.declare_parameter('baudrate', 9600)
+        self.declare_parameter('frame_id', 'imu_link')
 
+        port = self.get_parameter('port').value
+        baud = self.get_parameter('baudrate').value
+        frame_id = self.get_parameter('frame_id').value
 
-def check_sum(list_data, check_data):
-    return (sum(list_data) & 0xff) == check_data
+        # ---------------- Publisher ----------------
+        self.pub = self.create_publisher(Imu, '/imu/data', 10)
 
-
-def handle_serial_data(raw_byte):
-    """
-    Called per-byte from the serial read loop.
-    Updates global acceleration, angularVelocity, angle_degree, magnetometer.
-    Returns True when a complete orientation packet (0x53) was parsed and data is ready to publish.
-    """
-    global buff, key, angle_degree, magnetometer, acceleration, angularVelocity
-
-    angle_flag = False
-    buff[key] = raw_byte
-    key += 1
-
-    # Sync: first byte must be 0x55
-    if buff.get(0, None) != 0x55:
-        # reset and wait for next frame header
-        key = 0
-        buff = {}
-        return False
-
-    # wait until we have full packet (11 bytes)
-    if key < 11:
-        return False
-
-    # We have 11 bytes -> parse
-    data_buff = list(buff.values())
-    pkt_type = data_buff[1]
-
-    if pkt_type == 0x51:
-        # Accel packet
-        if check_sum(data_buff[0:10], data_buff[10]):
-            # bytes 2..9 hold 4 shorts; first 3 are accel
-            raw_shorts = hex_to_short(data_buff[2:10])
-            # scaling: original code used /32768 * 16 * 9.8  -> result in m/s^2
-            acceleration = [
-                raw_shorts[0] / 32768.0 * 16.0 * 9.8,
-                raw_shorts[1] / 32768.0 * 16.0 * 9.8,
-                raw_shorts[2] / 32768.0 * 16.0 * 9.8,
-            ]
-        else:
-            # checksum failed
-            pass
-
-    elif pkt_type == 0x52:
-        # Gyro packet
-        if check_sum(data_buff[0:10], data_buff[10]):
-            raw_shorts = hex_to_short(data_buff[2:10])
-            # scaling: /32768 * 2000 deg/s -> convert to rad/s
-            angularVelocity = [
-                raw_shorts[0] / 32768.0 * 2000.0 * math.pi / 180.0,
-                raw_shorts[1] / 32768.0 * 2000.0 * math.pi / 180.0,
-                raw_shorts[2] / 32768.0 * 2000.0 * math.pi / 180.0,
-            ]
-        else:
-            pass
-
-    elif pkt_type == 0x53:
-        # Angle packet (degrees)
-        if check_sum(data_buff[0:10], data_buff[10]):
-            raw_shorts = hex_to_short(data_buff[2:10])
-            angle_degree = [
-                raw_shorts[0] / 32768.0 * 180.0,
-                raw_shorts[1] / 32768.0 * 180.0,
-                raw_shorts[2] / 32768.0 * 180.0,
-            ]
-            angle_flag = True
-        else:
-            pass
-
-    elif pkt_type == 0x54:
-        # Magnetometer packet
-        if check_sum(data_buff[0:10], data_buff[10]):
-            magnetometer = hex_to_short(data_buff[2:10])
-        else:
-            pass
-
-    # reset buffer for next frame
-    key = 0
-    buff = {}
-    return angle_flag
-
-
-def get_quaternion_from_euler(roll, pitch, yaw):
-    """
-    Convert Euler angles (radians) to quaternion [x,y,z,w]
-    """
-    qx = np.sin(roll / 2.0) * np.cos(pitch / 2.0) * np.cos(yaw / 2.0) - np.cos(roll / 2.0) * np.sin(
-        pitch / 2.0) * np.sin(yaw / 2.0)
-    qy = np.cos(roll / 2.0) * np.sin(pitch / 2.0) * np.cos(yaw / 2.0) + np.sin(roll / 2.0) * np.cos(
-        pitch / 2.0) * np.sin(yaw / 2.0)
-    qz = np.cos(roll / 2.0) * np.cos(pitch / 2.0) * np.sin(yaw / 2.0) - np.sin(roll / 2.0) * np.sin(
-        pitch / 2.0) * np.cos(yaw / 2.0)
-    qw = np.cos(roll / 2.0) * np.cos(pitch / 2.0) * np.cos(yaw / 2.0) + np.sin(roll / 2.0) * np.sin(
-        pitch / 2.0) * np.sin(yaw / 2.0)
-    return [qx, qy, qz, qw]
-
-
-class IMUDriverNode(Node):
-    def __init__(self, port_name: str):
-        super().__init__('imu_driver_node')
-
-        # IMU message template
         self.imu_msg = Imu()
-        self.imu_msg.header.frame_id = 'imu_link'
+        self.imu_msg.header.frame_id = frame_id
 
-        # IMPORTANT: covariance arrays must be length 9 and floats
-        # Tune these values to your sensor spec. They MUST be > 0 (not all zeros).
-        self.imu_msg.orientation_covariance = [
-            0.002, 0.0, 0.0,
-            0.0, 0.002, 0.0,
-            0.0, 0.0, 0.002
-        ]
-        self.imu_msg.angular_velocity_covariance = [
-            0.02, 0.0, 0.0,
-            0.0, 0.02, 0.0,
-            0.0, 0.0, 0.02
-        ]
-        self.imu_msg.linear_acceleration_covariance = [
-            0.04, 0.0, 0.0,
-            0.0, 0.04, 0.0,
-            0.0, 0.0, 0.04
-        ]
+        # Covariances (important for EKF)
+        self.imu_msg.orientation_covariance[0] = 0.02
+        self.imu_msg.angular_velocity_covariance[0] = 0.02
+        self.imu_msg.linear_acceleration_covariance[0] = 0.04
 
-        self.imu_pub = self.create_publisher(Imu, 'imu/data', 10)
+        # ---------------- State ----------------
+        self.accel = [0.0, 0.0, 0.0]   # m/s^2
+        self.gyro  = [0.0, 0.0, 0.0]   # rad/s
+        self.euler = [0.0, 0.0, 0.0]   # rad
 
-        # Launch serial reader thread (daemon so it won't block shutdown)
-        self.driver_thread = threading.Thread(target=self.driver_loop, args=(port_name,), daemon=True)
-        self.driver_thread.start()
+        self.buffer = bytearray()
+        self.lock = threading.Lock()
+        self.running = True
 
-        self.get_logger().info(f"IMUDriverNode started, reading from {port_name}")
-
-    def driver_loop(self, port_name):
-        """
-        Open serial port and feed bytes into handle_serial_data.
-        When handle_serial_data returns True (orientation packet), call imu_data().
-        """
+        # ---------------- Serial ----------------
         try:
-            wt_imu = serial.Serial(port=port_name, baudrate=9600, timeout=0.5)
-            if wt_imu.isOpen():
-                self.get_logger().info("Serial port opened successfully")
-            else:
-                wt_imu.open()
-                self.get_logger().info("Serial port opened successfully")
+            self.ser = serial.Serial(port, baud, timeout=0.1)
+            self.get_logger().info(f"IMU connected on {port} @ {baud}")
         except Exception as e:
-            self.get_logger().error(f"Serial port opening failure: {e}")
-            return
+            self.get_logger().fatal(str(e))
+            raise SystemExit
 
-        try:
-            while rclpy.ok():
-                try:
-                    buff_count = wt_imu.in_waiting
-                except Exception as e:
-                    self.get_logger().error(f"Serial error (in_waiting): {e}")
-                    break
+        # ---------------- Thread ----------------
+        self.thread = threading.Thread(target=self.read_loop, daemon=True)
+        self.thread.start()
 
-                if buff_count and buff_count > 0:
-                    try:
-                        buff_data = wt_imu.read(buff_count)
-                    except Exception as e:
-                        self.get_logger().error(f"Serial read error: {e}")
-                        break
+    # ============================================================
+    def read_loop(self):
+        while rclpy.ok() and self.running:
+            data = self.ser.read(64)
+            if data:
+                self.buffer.extend(data)
+                self.parse_buffer()
 
-                    # iterate bytes and call parser
-                    for i in range(len(buff_data)):
-                        # each element is an int 0..255
-                        tag = handle_serial_data(buff_data[i])
-                        if tag:
-                            # orientation packet processed -> publish
-                            self.imu_data()
-                else:
-                    # avoid busy loop
-                    time.sleep(0.001)
-        finally:
-            try:
-                wt_imu.close()
-            except Exception:
-                pass
-            self.get_logger().info("Serial driver loop exiting")
+    # ============================================================
+    def parse_buffer(self):
+        while len(self.buffer) >= 11:
+            if self.buffer[0] != 0x55:
+                self.buffer.pop(0)
+                continue
 
-    def imu_data(self):
-        """
-        Compose and publish sensor_msgs/Imu using global values set by the parser.
-        This assumes the parser already scaled the raw values to SI units:
-          - acceleration: m/s^2
-          - angularVelocity: rad/s
-          - angle_degree: degrees
-        """
-        # Local copy to avoid race conditions
-        ax, ay, az = acceleration[0], acceleration[1], acceleration[2]
-        gx, gy, gz = angularVelocity[0], angularVelocity[1], angularVelocity[2]
-        ad0, ad1, ad2 = angle_degree[0], angle_degree[1], angle_degree[2]
+            frame = self.buffer[:11]
+            self.buffer = self.buffer[11:]
 
-        # Defensive checks
-        for v in (ax, ay, az, gx, gy, gz, ad0, ad1, ad2):
-            if not np.isfinite(v):
-                self.get_logger().warn("Dropping IMU publish: non-finite value detected")
-                return
+            if (sum(frame[:10]) & 0xFF) != frame[10]:
+                continue
 
-        # stamp
-        self.imu_msg.header.stamp = self.get_clock().now().to_msg()
+            frame_id = frame[1]
+            payload = struct.unpack('<hhhh', frame[2:10])
 
-        # fill fields
-        self.imu_msg.linear_acceleration.x = float(ax)
-        self.imu_msg.linear_acceleration.y = float(ay)
-        self.imu_msg.linear_acceleration.z = float(az)
+            with self.lock:
+                if frame_id == 0x51:  # Acceleration (g)
+                    self.accel = [
+                        payload[0] / 32768.0 * 16.0 * 9.80665,
+                        payload[1] / 32768.0 * 16.0 * 9.80665,
+                        payload[2] / 32768.0 * 16.0 * 9.80665,
+                    ]
 
-        self.imu_msg.angular_velocity.x = float(gx)
-        self.imu_msg.angular_velocity.y = float(gy)
-        self.imu_msg.angular_velocity.z = float(gz)
+                elif frame_id == 0x52:  # Gyro (deg/s)
+                    self.gyro = [
+                        math.radians(payload[0] / 32768.0 * 2000.0),
+                        math.radians(payload[1] / 32768.0 * 2000.0),
+                        math.radians(payload[2] / 32768.0 * 2000.0),
+                    ]
 
-        # angles -> radians -> quaternion
-        angle_radian = [math.radians(ad0), math.radians(ad1), math.radians(ad2)]
-        qx, qy, qz, qw = get_quaternion_from_euler(angle_radian[0], angle_radian[1], angle_radian[2])
+                elif frame_id == 0x53:  # Euler angles (deg)
+                    self.euler = [
+                        math.radians(payload[0] / 32768.0 * 180.0),
+                        math.radians(payload[1] / 32768.0 * 180.0),
+                        math.radians(payload[2] / 32768.0 * 180.0),
+                    ]
+                    self.publish_imu()
 
-        # normalize quaternion
-        qnorm = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
-        if qnorm == 0.0 or not np.isfinite(qnorm):
-            self.get_logger().warn("Invalid quaternion norm, skipping publish")
-            return
-        qx, qy, qz, qw = qx / qnorm, qy / qnorm, qz / qnorm, qw / qnorm
+    # ============================================================
+    def publish_imu(self):
+        roll, pitch, yaw = self.euler
+        qx, qy, qz, qw = self.euler_to_quat(roll, pitch, yaw)
 
-        self.imu_msg.orientation.x = float(qx)
-        self.imu_msg.orientation.y = float(qy)
-        self.imu_msg.orientation.z = float(qz)
-        self.imu_msg.orientation.w = float(qw)
+        msg = self.imu_msg
+        msg.header.stamp = self.get_clock().now().to_msg()
 
-        # publish
-        self.imu_pub.publish(self.imu_msg)
+        msg.orientation.x = qx
+        msg.orientation.y = qy
+        msg.orientation.z = qz
+        msg.orientation.w = qw
+
+        msg.angular_velocity.x = self.gyro[0]
+        msg.angular_velocity.y = self.gyro[1]
+        msg.angular_velocity.z = self.gyro[2]
+
+        msg.linear_acceleration.x = self.accel[0]
+        msg.linear_acceleration.y = self.accel[1]
+        msg.linear_acceleration.z = self.accel[2]
+
+        self.pub.publish(msg)
+
+    # ============================================================
+    @staticmethod
+    def euler_to_quat(roll, pitch, yaw):
+        cr = math.cos(roll / 2)
+        sr = math.sin(roll / 2)
+        cp = math.cos(pitch / 2)
+        sp = math.sin(pitch / 2)
+        cy = math.cos(yaw / 2)
+        sy = math.sin(yaw / 2)
+
+        return (
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        )
+
+    # ============================================================
+    def destroy_node(self):
+        self.running = False
+        self.ser.close()
+        super().destroy_node()
 
 
+# ================================================================
 def main():
     rclpy.init()
-    node = IMUDriverNode('/dev/imu')
-
+    node = WTIMUNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-
-    node.get_logger().info("Shutting down IMUDriverNode")
     node.destroy_node()
     rclpy.shutdown()
 
 
 if __name__ == '__main__':
     main()
+

@@ -29,9 +29,23 @@ class WTIMUNode(Node):
         self.imu_msg.header.frame_id = frame_id
 
         # Covariances (important for EKF)
-        self.imu_msg.orientation_covariance[0] = 0.02
-        self.imu_msg.angular_velocity_covariance[0] = 0.02
-        self.imu_msg.linear_acceleration_covariance[0] = 0.04
+        self.imu_msg.orientation_covariance = [
+            0.02, 0.0, 0.0,
+            0.0, 0.02, 0.0,
+            0.0, 0.0, 0.02
+        ]
+
+        self.imu_msg.angular_velocity_covariance = [
+            0.04, 0.0, 0.0,
+            0.0, 0.04, 0.0,
+            0.0, 0.0, 0.04
+        ]
+
+        self.imu_msg.linear_acceleration_covariance = [
+            0.04, 0.0, 0.0,
+            0.0, 0.04, 0.0,
+            0.0, 0.0, 0.04
+        ]
 
         # ---------------- State ----------------
         self.accel = [0.0, 0.0, 0.0]   # m/s^2
